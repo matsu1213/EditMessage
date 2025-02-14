@@ -1,61 +1,62 @@
 import discord
-from discord import app_commands
+import aiohttp
 import os
+import json
+from discord.ext import commands
 from dotenv import load_dotenv
 
 # .envファイルの読み込み
 load_dotenv()
 
-TOKEN = os.getenv("DISCORD_TOKEN")
-GUILD_ID = int(os.getenv("GUILD_ID"))
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+PERSPECTIVE_API_KEY = os.getenv("PERSPECTIVE_API_KEY")
 
-class MyBot(discord.Client):
-    def __init__(self):
-        intents = discord.Intents.default()
-        super().__init__(intents=intents)
-        self.tree = app_commands.CommandTree(self)
+intents = discord.Intents.default()
+intents.messages = True
+intents.message_content = True  # メッセージ内容の取得を許可
 
-    async def setup_hook(self):
-        guild = discord.Object(id=GUILD_ID)
-        self.tree.copy_global_to(guild=guild)
-        await self.tree.sync(guild=guild)
+bot = commands.Bot(command_prefix="!", intents=intents)
 
-bot = MyBot()
+async def analyze_toxicity(text: str) -> float:
+    """Perspective API を使用してメッセージのTOXICスコアを取得"""
+    url = "https://commentanalyzer.googleapis.com/v1alpha1/comments:analyze"
+    headers = {"Content-Type": "application/json"}
+    data = {
+        "comment": {"text": text},
+        "languages": ["en"],
+        "requestedAttributes": {"TOXICITY": {}},
+        "key": PERSPECTIVE_API_KEY
+    }
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, headers=headers, json=data) as response:
+            if response.status == 200:
+                result = await response.json()
+                return result["attributeScores"]["TOXICITY"]["summaryScore"]["value"]
+            else:
+                print(f"APIエラー: {response.status}")
+                return 0.0
 
 @bot.event
 async def on_ready():
-    print(f'ログイン完了: {bot.user}')
+    print(f"ログイン完了: {bot.user}")
 
-@bot.tree.command(name="edit_message", description="指定したメッセージを編集します")
-@app_commands.describe(
-    channel_id="編集したいメッセージがあるチャンネルのID",
-    message_id="編集したいメッセージのID",
-    new_content="メッセージの新しい内容"
-)
-async def edit_message(interaction: discord.Interaction, channel_id: str, message_id: str, new_content: str):
-    # 実行者の権限をチェック
-    if not interaction.user.guild_permissions.manage_messages:
-        await interaction.response.send_message("このコマンドを実行するには「メッセージの管理」権限が必要です。", ephemeral=True)
-        return
+@bot.event
+async def on_message(message):
+    if message.author.bot:
+        return  # Botのメッセージは無視
 
-    try:
-        # チャンネルとメッセージの取得
-        channel = bot.get_channel(int(channel_id))
-        if not isinstance(channel, discord.TextChannel):
-            await interaction.response.send_message("指定されたチャンネルが見つかりません。", ephemeral=True)
-            return
+    toxicity_score = await analyze_toxicity(message.content)
 
-        message = await channel.fetch_message(int(message_id))
-        await message.edit(content=new_content)
-        
-        await interaction.response.send_message("メッセージを編集しました。", ephemeral=True)
-    
-    except discord.NotFound:
-        await interaction.response.send_message("指定されたメッセージが見つかりません。", ephemeral=True)
-    except discord.Forbidden:
-        await interaction.response.send_message("Botにメッセージを編集する権限がありません。", ephemeral=True)
-    except Exception as e:
-        print(f"エラー: {e}")
-        await interaction.response.send_message("メッセージの編集に失敗しました。", ephemeral=True)
+    if toxicity_score >= 0.3:
+        try:
+            await message.delete()
+            await message.channel.send(f"{message.author.mention} 不適切な発言のため、メッセージが削除されました。（TOXICスコア: {toxicity_score:.2f}）", delete_after=5)
+        except discord.Forbidden:
+            print("削除権限がありません")
+        except discord.HTTPException as e:
+            print(f"削除エラー: {e}")
 
-bot.run(TOKEN)
+    await bot.process_commands(message)
+
+bot.run(DISCORD_TOKEN)
